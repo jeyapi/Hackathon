@@ -1,8 +1,12 @@
 import os
 import re
+import json
+import hashlib
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import nltk
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -45,6 +49,11 @@ BERT_MAX_LEN = 128
 BERT_BATCH_SIZE = 16
 BERT_EPOCHS = 3
 BERT_LR = 2e-5
+BERT_ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts", "bert_classifier")
+BERT_MODEL_DIR = os.path.join(BERT_ARTIFACT_DIR, "model")
+BERT_TOKENIZER_DIR = os.path.join(BERT_ARTIFACT_DIR, "tokenizer")
+BERT_LABELS_PATH = os.path.join(BERT_ARTIFACT_DIR, "label_classes.json")
+BERT_METADATA_PATH = os.path.join(BERT_ARTIFACT_DIR, "metadata.json")
 
 NINE_BOX_LAYOUT = [
     [
@@ -361,11 +370,133 @@ def build_analysis(df_raw: pd.DataFrame, anonymize: bool) -> pd.DataFrame:
 
 
 
+def file_sha256(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def compute_bert_fingerprint(train_path: str, test_path: str) -> tuple[str, dict]:
+    payload = {
+        "model_name": BERT_MODEL_NAME,
+        "max_len": BERT_MAX_LEN,
+        "batch_size": BERT_BATCH_SIZE,
+        "epochs": BERT_EPOCHS,
+        "learning_rate": BERT_LR,
+        "anonymization": "names_to_john_and_she_her_to_he_his",
+        "train_sha256": file_sha256(train_path),
+        "test_sha256": file_sha256(test_path),
+    }
+    fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return fingerprint, payload
+
+
+def save_bert_artifacts(model, tokenizer, label_classes: list[str], metadata: dict):
+    os.makedirs(BERT_ARTIFACT_DIR, exist_ok=True)
+    model.save_pretrained(BERT_MODEL_DIR)
+    tokenizer.save_pretrained(BERT_TOKENIZER_DIR)
+
+    with open(BERT_LABELS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(label_classes, fh, indent=2)
+
+    save_meta = dict(metadata)
+    save_meta["saved_at_utc"] = datetime.now(timezone.utc).isoformat()
+    with open(BERT_METADATA_PATH, "w", encoding="utf-8") as fh:
+        json.dump(save_meta, fh, indent=2)
+
+
+def load_bert_artifacts(expected_fingerprint: str):
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    except ImportError as exc:
+        return {"ok": False, "reason": f"Missing dependency: {exc}"}
+
+    required_paths = [BERT_MODEL_DIR, BERT_TOKENIZER_DIR, BERT_LABELS_PATH, BERT_METADATA_PATH]
+    if not all(os.path.exists(path) for path in required_paths):
+        return {"ok": False, "reason": "No saved BERT artifacts found."}
+
+    try:
+        with open(BERT_METADATA_PATH, "r", encoding="utf-8") as fh:
+            metadata = json.load(fh)
+        if metadata.get("fingerprint") != expected_fingerprint:
+            return {"ok": False, "reason": "Saved model is outdated for current datasets/config."}
+
+        with open(BERT_LABELS_PATH, "r", encoding="utf-8") as fh:
+            label_classes = json.load(fh)
+
+        tokenizer = AutoTokenizer.from_pretrained(BERT_TOKENIZER_DIR)
+        model = AutoModelForSequenceClassification.from_pretrained(BERT_MODEL_DIR)
+        le = LabelEncoder()
+        le.classes_ = np.array(label_classes, dtype=object)
+        return {
+            "ok": True,
+            "model": model,
+            "tokenizer": tokenizer,
+            "label_encoder": le,
+            "metadata": metadata,
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"Unable to load saved model: {exc}"}
+
+
+def evaluate_bert_model(model, tokenizer, label_encoder: LabelEncoder, df_test: pd.DataFrame, device):
+    import torch
+    from torch.utils.data import Dataset, DataLoader
+
+    class FeedbackDataset(Dataset):
+        def __init__(self, texts, labels):
+            self.enc = tokenizer(
+                texts,
+                truncation=True,
+                padding=True,
+                max_length=BERT_MAX_LEN,
+                return_tensors=None,
+            )
+            self.labels = labels
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, idx):
+            item = {k: torch.tensor(v[idx]) for k, v in self.enc.items()}
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+            return item
+
+    y_test = label_encoder.transform(df_test["nine_box_category"])
+    x_test = df_test["feedback"].astype(str).tolist()
+    test_loader = DataLoader(FeedbackDataset(x_test, y_test), batch_size=BERT_BATCH_SIZE, shuffle=False)
+
+    model.to(device)
+    model.eval()
+    all_preds, all_probs = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch.pop("labels")
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(**batch)
+            probs = torch.softmax(out.logits, dim=-1).cpu().numpy()
+            preds = out.logits.argmax(dim=-1).cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_probs.extend(probs.tolist())
+
+    predicted_labels = label_encoder.inverse_transform(all_preds)
+    actual_labels = label_encoder.inverse_transform(y_test)
+    acc = accuracy_score(y_test, all_preds)
+    report = classification_report(y_test, all_preds, target_names=label_encoder.classes_, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_test, all_preds)
+    test_results = build_prediction_results_df(df_test, actual_labels, predicted_labels, all_probs)
+    return acc, report, cm, test_results
+
+
 @st.cache_resource(show_spinner=False)
-def train_bert_classifier():
-    """Fine-tune DistilBERT on the training CSV and evaluate on the test CSV.
-    Cached for the lifetime of the Streamlit server process.
-    """
+def train_bert_classifier(force_retrain: bool = False, run_id: int = 0):
+    """Fine-tune or load DistilBERT and evaluate on the test CSV."""
+    _ = run_id
     try:
         import torch
         from torch.utils.data import Dataset, DataLoader
@@ -380,23 +511,44 @@ def train_bert_classifier():
 
     df_tr = pd.read_csv(train_path).dropna(subset=["feedback", "nine_box_category"])
     df_te = pd.read_csv(test_path).dropna(subset=["feedback", "nine_box_category"])
+    fingerprint, fingerprint_payload = compute_bert_fingerprint(train_path, test_path)
 
-    # Anonymise texts before training: replace names with John Doe and neutralise pronouns
     tr_names = df_tr["person_name"].dropna().tolist() if "person_name" in df_tr.columns else []
     te_names = df_te["person_name"].dropna().tolist() if "person_name" in df_te.columns else []
     all_names = list(set(tr_names + te_names))
     df_tr["feedback"] = df_tr["feedback"].apply(lambda t: anonymize_for_bert(t, all_names))
     df_te["feedback"] = df_te["feedback"].apply(lambda t: anonymize_for_bert(t, all_names))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not force_retrain:
+        loaded = load_bert_artifacts(expected_fingerprint=fingerprint)
+        if loaded["ok"]:
+            model = loaded["model"]
+            tokenizer = loaded["tokenizer"]
+            le = loaded["label_encoder"]
+            acc, report, cm, test_results = evaluate_bert_model(model, tokenizer, le, df_te, device)
+            return {
+                "ok": True,
+                "model": model,
+                "tokenizer": tokenizer,
+                "label_encoder": le,
+                "device": device,
+                "accuracy": acc,
+                "report": report,
+                "confusion_matrix": cm,
+                "labels": le.classes_.tolist(),
+                "history": loaded.get("metadata", {}).get("history", []),
+                "test_results": test_results,
+                "source": "saved_artifact",
+                "fingerprint": fingerprint,
+            }
+
     le = LabelEncoder()
     le.fit(pd.concat([df_tr["nine_box_category"], df_te["nine_box_category"]]))
     y_train = le.transform(df_tr["nine_box_category"])
-    y_test = le.transform(df_te["nine_box_category"])
     x_train = df_tr["feedback"].astype(str).tolist()
-    x_test = df_te["feedback"].astype(str).tolist()
-
     num_labels = len(le.classes_)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
     model = AutoModelForSequenceClassification.from_pretrained(BERT_MODEL_NAME, num_labels=num_labels)
@@ -422,8 +574,6 @@ def train_bert_classifier():
             return item
 
     train_loader = DataLoader(FeedbackDataset(x_train, y_train), batch_size=BERT_BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(FeedbackDataset(x_test, y_test), batch_size=BERT_BATCH_SIZE, shuffle=False)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=BERT_LR)
 
     history = []
@@ -439,25 +589,20 @@ def train_bert_classifier():
             total_loss += out.loss.item()
         history.append({"epoch": epoch + 1, "loss": round(total_loss / len(train_loader), 4)})
 
-    model.eval()
-    all_preds, all_probs = [], []
-    with torch.no_grad():
-        for batch in test_loader:
-            batch.pop("labels")
-            batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(**batch)
-            probs = torch.softmax(out.logits, dim=-1).cpu().numpy()
-            preds = out.logits.argmax(dim=-1).cpu().numpy()
-            all_preds.extend(preds.tolist())
-            all_probs.extend(probs.tolist())
+    save_bert_artifacts(
+        model=model,
+        tokenizer=tokenizer,
+        label_classes=le.classes_.tolist(),
+        metadata={
+            "fingerprint": fingerprint,
+            "config": fingerprint_payload,
+            "history": history,
+            "train_rows": int(len(df_tr)),
+            "test_rows": int(len(df_te)),
+        },
+    )
 
-    predicted_labels = le.inverse_transform(all_preds)
-    actual_labels = le.inverse_transform(y_test)
-    acc = accuracy_score(y_test, all_preds)
-    report = classification_report(y_test, all_preds, target_names=le.classes_, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_test, all_preds)
-    test_results = build_prediction_results_df(df_te, actual_labels, predicted_labels, all_probs)
-
+    acc, report, cm, test_results = evaluate_bert_model(model, tokenizer, le, df_te, device)
     return {
         "ok": True,
         "model": model,
@@ -470,6 +615,8 @@ def train_bert_classifier():
         "labels": le.classes_.tolist(),
         "history": history,
         "test_results": test_results,
+        "source": "trained_now",
+        "fingerprint": fingerprint,
     }
 
 
@@ -678,24 +825,52 @@ def main():
     else:
         if "bert_done" not in st.session_state:
             st.session_state["bert_done"] = False
+        if "bert_run_id" not in st.session_state:
+            st.session_state["bert_run_id"] = 0
 
         if not st.session_state["bert_done"]:
             st.info(
-                "Click the button below to fine-tune DistilBERT. "
-                "The model downloads once (~250 MB) and trains for 3 epochs on CPU — allow a few minutes."
+                "Click to train DistilBERT. If a compatible saved model exists, it loads instantly from disk."
             )
-            if st.button("Fine-tune DistilBERT", key="bert_btn"):
+            bt1, bt2 = st.columns(2)
+            train_clicked = bt1.button("Train / Load DistilBERT", key="bert_btn")
+            retrain_clicked = bt2.button("Retrain and overwrite", key="bert_btn_retrain")
+            if train_clicked or retrain_clicked:
+                if retrain_clicked:
+                    st.session_state["bert_run_id"] += 1
+                    train_bert_classifier.clear()
                 with st.spinner("Downloading model weights and fine-tuning DistilBERT…"):
-                    _res = train_bert_classifier()
+                    _res = train_bert_classifier(
+                        force_retrain=retrain_clicked,
+                        run_id=st.session_state["bert_run_id"],
+                    )
+                if retrain_clicked:
+                    train_bert_classifier.clear()
                 st.session_state["bert_done"] = True
                 st.rerun()
         else:
             import torch
-            bert_res = train_bert_classifier()  # instant — served from cache
+            bert_res = train_bert_classifier(force_retrain=False, run_id=st.session_state["bert_run_id"])
 
             if not bert_res["ok"]:
                 st.error(f"BERT training failed: {bert_res['reason']}")
             else:
+                if bert_res.get("source") == "saved_artifact":
+                    st.success("Loaded saved DistilBERT model from disk. Retraining was skipped.")
+                else:
+                    st.success("DistilBERT trained and saved to disk for future sessions.")
+
+                if st.button("Retrain model and overwrite saved artifacts", key="bert_btn_retrain_live"):
+                    st.session_state["bert_run_id"] += 1
+                    train_bert_classifier.clear()
+                    with st.spinner("Retraining DistilBERT and updating saved artifacts…"):
+                        _res = train_bert_classifier(
+                            force_retrain=True,
+                            run_id=st.session_state["bert_run_id"],
+                        )
+                    train_bert_classifier.clear()
+                    st.rerun()
+
                 bm1, bm2, bm3 = st.columns(3)
                 bm1.metric("Test accuracy", f"{bert_res['accuracy'] * 100:.1f}%")
                 macro_f1 = bert_res["report"].get("macro avg", {}).get("f1-score", 0.0)
@@ -706,12 +881,15 @@ def main():
                 bl, br = st.columns(2)
                 with bl:
                     hist_df = pd.DataFrame(bert_res["history"])
-                    fig_loss = px.line(
-                        hist_df, x="epoch", y="loss", markers=True,
-                        title="Training loss per epoch",
-                        labels={"loss": "Cross-entropy loss", "epoch": "Epoch"},
-                    )
-                    st.plotly_chart(fig_loss, use_container_width=True)
+                    if not hist_df.empty:
+                        fig_loss = px.line(
+                            hist_df, x="epoch", y="loss", markers=True,
+                            title="Training loss per epoch",
+                            labels={"loss": "Cross-entropy loss", "epoch": "Epoch"},
+                        )
+                        st.plotly_chart(fig_loss, use_container_width=True)
+                    else:
+                        st.info("Training history unavailable for this loaded model.")
                 with br:
                     short_labels = [
                         lbl.split("'")[1] if "'" in lbl else lbl
@@ -799,22 +977,29 @@ def main():
                         results_df = results_df[~results_df["match"]]
 
                     st.caption(f"Showing {len(results_df)} test comments from employee_review_mturk_dataset_test_v6_kaggle.csv")
-                    st.dataframe(
-                        results_df[[
-                            col for col in [
-                                "id",
-                                "person_name",
-                                "actual_box",
-                                "predicted_box",
-                                "match",
-                                "confidence",
-                                "feedback",
-                            ]
-                            if col in results_df.columns
-                        ]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    
+                    summary_df = results_df[[
+                        col for col in [
+                            "id",
+                            "person_name",
+                            "actual_box",
+                            "predicted_box",
+                            "match",
+                            "confidence",
+                        ]
+                        if col in results_df.columns
+                    ]].copy()
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                    st.subheader("Full feedback review")
+                    for idx, row in results_df.iterrows():
+                        match_badge = "✅ Correct" if row["match"] else "❌ Error"
+                        with st.expander(f"{match_badge} — {row.get('person_name', 'Unknown')} | Actual: {row['actual_box']} → Predicted: {row['predicted_box']}"):
+                            st.markdown(f"**Feedback:** {row['feedback']}")
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Actual", row["actual_box"])
+                            col2.metric("Predicted", row["predicted_box"])
+                            col3.metric("Confidence", f"{row['confidence']*100:.1f}%")
 
                     test_csv = results_df.to_csv(index=False).encode("utf-8")
                     st.download_button(
