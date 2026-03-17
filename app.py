@@ -49,7 +49,7 @@ BERT_LR = 2e-5
 NINE_BOX_LAYOUT = [
     [
         {"box": 7, "name": "Potential Gem", "performance": "Low", "potential": "High", "color": "#fde047"},
-        {"box": 8, "name": "High Potential", "performance": "Moderate", "potential": "High", "color": "#fde047"},
+        {"box": 8, "name": "High Potential", "performance": "Moderate", "potential": "High", "color": "#a3e635"},
         {"box": 9, "name": "Star", "performance": "High", "potential": "High", "color": "#a3e635"},
     ],
     [
@@ -734,14 +734,17 @@ def main():
                 pred_counts = bert_res["test_results"]["predicted_category"].value_counts().to_dict()
                 actual_counts = bert_res["test_results"]["actual_category"].value_counts().to_dict()
                 correct_counts = bert_res["test_results"][bert_res["test_results"]["match"]]["predicted_category"].value_counts().to_dict()
+                label_by_box = {
+                    parsed["box"]: lbl
+                    for lbl in bert_res["labels"]
+                    for parsed in [parse_nine_box_category(lbl)]
+                    if parsed["box"] is not None
+                }
                 matrix_html_rows = []
                 for row in NINE_BOX_LAYOUT:
                     row_cells = []
                     for cell in row:
-                        full_label = next(
-                            (lbl for lbl in bert_res["labels"] if f"Box {cell['box']}:" in format_box_label(lbl) or cell["name"].lower() in lbl.lower()),
-                            None,
-                        )
+                        full_label = label_by_box.get(cell["box"])
                         n_pred = pred_counts.get(full_label, 0) if full_label else 0
                         n_actual = actual_counts.get(full_label, 0) if full_label else 0
                         n_correct = correct_counts.get(full_label, 0) if full_label else 0
