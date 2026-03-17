@@ -6,10 +6,8 @@ import nltk
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
 st.set_page_config(page_title="HR Feedback Intelligence", page_icon="HR", layout="wide")
 
@@ -41,6 +39,30 @@ NEGATIVE_WORDS = {
     "poor", "bad", "worst", "lazy", "apathy", "reckless", "failed", "lacking", "struggle",
     "underperform", "inconsistent", "unreliable", "mediocre", "terrible", "awful", "substandard", "slow",
 }
+
+BERT_MODEL_NAME = "distilbert-base-uncased"
+BERT_MAX_LEN = 128
+BERT_BATCH_SIZE = 16
+BERT_EPOCHS = 3
+BERT_LR = 2e-5
+
+NINE_BOX_LAYOUT = [
+    [
+        {"box": 7, "name": "Potential Gem", "performance": "Low", "potential": "High", "color": "#fde047"},
+        {"box": 8, "name": "High Potential", "performance": "Moderate", "potential": "High", "color": "#fde047"},
+        {"box": 9, "name": "Star", "performance": "High", "potential": "High", "color": "#a3e635"},
+    ],
+    [
+        {"box": 4, "name": "Inconsistent Player", "performance": "Low", "potential": "Moderate", "color": "#f97316"},
+        {"box": 5, "name": "Core Player", "performance": "Moderate", "potential": "Moderate", "color": "#facc15"},
+        {"box": 6, "name": "High Performer", "performance": "High", "potential": "Moderate", "color": "#a3e635"},
+    ],
+    [
+        {"box": 1, "name": "Risk", "performance": "Low", "potential": "Low", "color": "#ef4444"},
+        {"box": 2, "name": "Average Performer", "performance": "Moderate", "potential": "Low", "color": "#f97316"},
+        {"box": 3, "name": "Solid Performer", "performance": "High", "potential": "Low", "color": "#fde047"},
+    ],
+]
 
 GENDERED_SHE = {"she", "her", "hers", "herself"}
 GENDERED_HE = {"he", "him", "his", "himself"}
@@ -190,6 +212,103 @@ def extract_perf_pot(category: str) -> tuple[str, str]:
     return perf, pot
 
 
+def anonymize_for_bert(text: str, names: list[str] | None = None) -> str:
+    """Replace person names with 'John Doe' and neutralise female pronouns."""
+    text = str(text)
+
+    # Replace any provided names (first / last / full)
+    if names:
+        for name in names:
+            for part in str(name).strip().split():
+                if len(part) > 2:
+                    text = re.sub(rf"\b{re.escape(part)}\b", "John", text, flags=re.IGNORECASE)
+
+    # Pronoun neutralisation (order matters: longest forms first)
+    replacements = [
+        (r"\bherself\b", "himself"),
+        (r"\bshe\b", "he"),
+        (r"\bher\b", "his"),
+        (r"\bhers\b", "his"),
+        (r"\bShe\b", "He"),
+        (r"\bHer\b", "His"),
+        (r"\bHers\b", "His"),
+        (r"\bHerself\b", "Himself"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+
+    return text
+
+
+def parse_nine_box_category(category: str) -> dict:
+    category = str(category)
+    box_match = re.search(r"Category\s+(\d+)", category)
+    name_match = re.search(r"'([^']+)'", category)
+    performance, potential = extract_perf_pot(category)
+    return {
+        "box": int(box_match.group(1)) if box_match else None,
+        "name": name_match.group(1) if name_match else category,
+        "performance": performance,
+        "potential": potential,
+        "raw": category,
+    }
+
+
+def format_box_label(category: str) -> str:
+    parsed = parse_nine_box_category(category)
+    if parsed["box"] is None:
+        return parsed["name"]
+    return f"Box {parsed['box']} - {parsed['name']}"
+
+
+def render_nine_box_matrix(predicted_category: str):
+    parsed = parse_nine_box_category(predicted_category)
+    predicted_box = parsed["box"]
+    html_rows = []
+
+    for row in NINE_BOX_LAYOUT:
+        row_html = []
+        for cell in row:
+            is_selected = cell["box"] == predicted_box
+            border = "4px solid #111827" if is_selected else "1px solid #d1d5db"
+            shadow = "box-shadow: 0 0 0 3px rgba(17,24,39,0.15);" if is_selected else ""
+            row_html.append(
+                f"<div style='background:{cell['color']};border:{border};{shadow}padding:12px;border-radius:8px;min-height:110px;display:flex;flex-direction:column;justify-content:center;text-align:center'>"
+                f"<div style='font-size:14px;font-weight:700;color:#111827'>Box {cell['box']}</div>"
+                f"<div style='font-size:16px;font-weight:700;color:#111827'>{cell['name']}</div>"
+                f"<div style='font-size:12px;color:#111827'>{cell['potential']} potential</div>"
+                f"<div style='font-size:12px;color:#111827'>{cell['performance']} performance</div>"
+                "</div>"
+            )
+        html_rows.append("".join(row_html))
+
+    st.markdown(
+        "<div style='margin-top:6px'>"
+        "<div style='font-size:13px;font-weight:700;margin-bottom:8px'>Predicted position on the 9-box matrix</div>"
+        "<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px'>"
+        f"{''.join(html_rows)}"
+        "</div>"
+        "<div style='display:flex;justify-content:space-between;margin-top:6px;font-size:12px;color:#374151'>"
+        "<span>Performance: Low to High</span>"
+        "<span>Potential: Low to High</span>"
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def build_prediction_results_df(source_df: pd.DataFrame, actual_labels, predicted_labels, probabilities) -> pd.DataFrame:
+    results = source_df[[col for col in ["id", "person_name", "feedback", "nine_box_category"] if col in source_df.columns]].copy()
+    results = results.reset_index(drop=True)
+    results["actual_category"] = list(actual_labels)
+    results["predicted_category"] = list(predicted_labels)
+    results["actual_box"] = results["actual_category"].apply(format_box_label)
+    results["predicted_box"] = results["predicted_category"].apply(format_box_label)
+    results["match"] = results["actual_category"] == results["predicted_category"]
+    results["confidence"] = [round(float(max(row)), 4) for row in probabilities]
+    return results
+
+
 def highlight_feedback(text: str) -> str:
     out = []
     for token in str(text).split():
@@ -241,45 +360,116 @@ def build_analysis(df_raw: pd.DataFrame, anonymize: bool) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data
-def train_text_model(df: pd.DataFrame) -> dict:
-    if "nine_box_category" not in df.columns or "feedback" not in df.columns:
-        return {"ok": False, "reason": "Missing required columns"}
 
-    model_df = df[["feedback", "nine_box_category"]].dropna().copy()
-    model_df = model_df[model_df["feedback"].astype(str).str.len() > 5]
+@st.cache_resource(show_spinner=False)
+def train_bert_classifier():
+    """Fine-tune DistilBERT on the training CSV and evaluate on the test CSV.
+    Cached for the lifetime of the Streamlit server process.
+    """
+    try:
+        import torch
+        from torch.utils.data import Dataset, DataLoader
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    except ImportError as exc:
+        return {"ok": False, "reason": f"Missing dependency: {exc}"}
 
-    if model_df["nine_box_category"].nunique() < 2 or len(model_df) < 60:
-        return {"ok": False, "reason": "Insufficient class diversity"}
+    train_path = os.path.join(DATASET_DIR, "employee_review_mturk_dataset_v10_kaggle.csv")
+    test_path = os.path.join(DATASET_DIR, "employee_review_mturk_dataset_test_v6_kaggle.csv")
+    if not os.path.exists(train_path) or not os.path.exists(test_path):
+        return {"ok": False, "reason": "Both dataset CSVs must be present in dataset/"}
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        model_df["feedback"].astype(str),
-        model_df["nine_box_category"].astype(str),
-        test_size=0.25,
-        random_state=42,
-        stratify=model_df["nine_box_category"].astype(str),
-    )
+    df_tr = pd.read_csv(train_path).dropna(subset=["feedback", "nine_box_category"])
+    df_te = pd.read_csv(test_path).dropna(subset=["feedback", "nine_box_category"])
 
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95)
-    x_train_vec = vectorizer.fit_transform(x_train)
-    x_test_vec = vectorizer.transform(x_test)
+    # Anonymise texts before training: replace names with John Doe and neutralise pronouns
+    tr_names = df_tr["person_name"].dropna().tolist() if "person_name" in df_tr.columns else []
+    te_names = df_te["person_name"].dropna().tolist() if "person_name" in df_te.columns else []
+    all_names = list(set(tr_names + te_names))
+    df_tr["feedback"] = df_tr["feedback"].apply(lambda t: anonymize_for_bert(t, all_names))
+    df_te["feedback"] = df_te["feedback"].apply(lambda t: anonymize_for_bert(t, all_names))
 
-    clf = LogisticRegression(max_iter=1500, n_jobs=None)
-    clf.fit(x_train_vec, y_train)
+    le = LabelEncoder()
+    le.fit(pd.concat([df_tr["nine_box_category"], df_te["nine_box_category"]]))
+    y_train = le.transform(df_tr["nine_box_category"])
+    y_test = le.transform(df_te["nine_box_category"])
+    x_train = df_tr["feedback"].astype(str).tolist()
+    x_test = df_te["feedback"].astype(str).tolist()
 
-    pred = clf.predict(x_test_vec)
-    acc = accuracy_score(y_test, pred)
-    cm = confusion_matrix(y_test, pred, labels=sorted(y_test.unique()))
-    report = classification_report(y_test, pred, output_dict=True, zero_division=0)
+    num_labels = len(le.classes_)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(BERT_MODEL_NAME, num_labels=num_labels)
+    model.to(device)
+
+    class FeedbackDataset(Dataset):
+        def __init__(self, texts, labels):
+            self.enc = tokenizer(
+                texts,
+                truncation=True,
+                padding=True,
+                max_length=BERT_MAX_LEN,
+                return_tensors=None,
+            )
+            self.labels = labels
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, idx):
+            item = {k: torch.tensor(v[idx]) for k, v in self.enc.items()}
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+            return item
+
+    train_loader = DataLoader(FeedbackDataset(x_train, y_train), batch_size=BERT_BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(FeedbackDataset(x_test, y_test), batch_size=BERT_BATCH_SIZE, shuffle=False)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=BERT_LR)
+
+    history = []
+    for epoch in range(BERT_EPOCHS):
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(**batch)
+            out.loss.backward()
+            optimizer.step()
+            total_loss += out.loss.item()
+        history.append({"epoch": epoch + 1, "loss": round(total_loss / len(train_loader), 4)})
+
+    model.eval()
+    all_preds, all_probs = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch.pop("labels")
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(**batch)
+            probs = torch.softmax(out.logits, dim=-1).cpu().numpy()
+            preds = out.logits.argmax(dim=-1).cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_probs.extend(probs.tolist())
+
+    predicted_labels = le.inverse_transform(all_preds)
+    actual_labels = le.inverse_transform(y_test)
+    acc = accuracy_score(y_test, all_preds)
+    report = classification_report(y_test, all_preds, target_names=le.classes_, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_test, all_preds)
+    test_results = build_prediction_results_df(df_te, actual_labels, predicted_labels, all_probs)
 
     return {
         "ok": True,
-        "vectorizer": vectorizer,
-        "model": clf,
+        "model": model,
+        "tokenizer": tokenizer,
+        "label_encoder": le,
+        "device": device,
         "accuracy": acc,
-        "labels": sorted(y_test.unique()),
-        "confusion_matrix": cm,
         "report": report,
+        "confusion_matrix": cm,
+        "labels": le.classes_.tolist(),
+        "history": history,
+        "test_results": test_results,
     }
 
 
@@ -445,76 +635,238 @@ def main():
         st.plotly_chart(fig_q2, use_container_width=True)
 
     if not group_only:
-        st.subheader("Comment explorer")
-        f1, f2, f3 = st.columns(3)
-        sentiment_filter = f1.multiselect("Sentiment", ["Positive", "Neutral", "Negative"], default=["Positive", "Neutral", "Negative"])
-        topic_filter = f2.multiselect("Topics", list(TOPICS.keys()) + ["Other"])
-        quality_filter = f3.multiselect("Quality", ["Excellent", "Good", "Fair", "Poor"])
+        with st.expander("Comment explorer", expanded=False):
+            f1, f2, f3 = st.columns(3)
+            sentiment_filter = f1.multiselect("Sentiment", ["Positive", "Neutral", "Negative"], default=["Positive", "Neutral", "Negative"])
+            topic_filter = f2.multiselect("Topics", list(TOPICS.keys()) + ["Other"])
+            quality_filter = f3.multiselect("Quality", ["Excellent", "Good", "Fair", "Poor"])
 
-        mask = df["sentiment"].isin(sentiment_filter)
-        if topic_filter:
-            mask &= df["topics"].apply(lambda x: any(t in x for t in topic_filter))
-        if quality_filter:
-            mask &= df["quality_label"].isin(quality_filter)
+            mask = df["sentiment"].isin(sentiment_filter)
+            if topic_filter:
+                mask &= df["topics"].apply(lambda x: any(t in x for t in topic_filter))
+            if quality_filter:
+                mask &= df["quality_label"].isin(quality_filter)
 
-        view = df[mask]
-        st.caption(f"Showing {min(60, len(view))} / {len(view)} comments")
+            view = df[mask]
+            st.caption(f"Showing {min(60, len(view))} / {len(view)} comments")
 
-        for _, row in view.head(60).iterrows():
-            flags = ", ".join(row["bias_flags"]) if row["bias_flags"] else "none"
-            color = BADGE_COLOR[row["sentiment"]]
-            st.markdown(
-                f"<div style='border-left:4px solid {color};padding:10px 12px;margin-bottom:8px;background:#fafafa;border-radius:6px'>"
-                f"<div style='font-size:13px;color:#111827'><b>{row['name']}</b> | <b>{row['sentiment']}</b> ({row['sentiment_score']:+.2f}) | "
-                f"Quality: {row['quality_label']} ({row['quality_score']}) | Topics: {row['topics']} | Flags: {flags}</div>"
-                f"<div style='margin-top:6px;font-size:14px;color:#1f2937'>{highlight_feedback(row['feedback'])}</div>"
-                "</div>",
-                unsafe_allow_html=True,
+            for _, row in view.head(60).iterrows():
+                flags = ", ".join(row["bias_flags"]) if row["bias_flags"] else "none"
+                color = BADGE_COLOR[row["sentiment"]]
+                st.markdown(
+                    f"<div style='border-left:4px solid {color};padding:10px 12px;margin-bottom:8px;background:#fafafa;border-radius:6px'>"
+                    f"<div style='font-size:13px;color:#111827'><b>{row['name']}</b> | <b>{row['sentiment']}</b> ({row['sentiment_score']:+.2f}) | "
+                    f"Quality: {row['quality_label']} ({row['quality_score']}) | Topics: {row['topics']} | Flags: {flags}</div>"
+                    f"<div style='margin-top:6px;font-size:14px;color:#1f2937'>{highlight_feedback(row['feedback'])}</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ── BERT Employee Classification ─────────────────────────────────────────
+    st.divider()
+    st.subheader("BERT Employee Classification")
+    st.caption(
+        f"DistilBERT fine-tuned on the training set (878 samples) and evaluated on the held-out test set (225 samples) "
+        f"over {BERT_EPOCHS} epochs — CPU training."
+    )
+
+    bert_train_ok = os.path.exists(os.path.join(DATASET_DIR, "employee_review_mturk_dataset_v10_kaggle.csv"))
+    bert_test_ok = os.path.exists(os.path.join(DATASET_DIR, "employee_review_mturk_dataset_test_v6_kaggle.csv"))
+
+    if not (bert_train_ok and bert_test_ok):
+        st.warning("Both dataset CSVs must be present in the dataset/ folder to run BERT training.")
+    else:
+        if "bert_done" not in st.session_state:
+            st.session_state["bert_done"] = False
+
+        if not st.session_state["bert_done"]:
+            st.info(
+                "Click the button below to fine-tune DistilBERT. "
+                "The model downloads once (~250 MB) and trains for 3 epochs on CPU — allow a few minutes."
             )
-
-    if "nine_box_category" in df_raw.columns:
-        st.subheader("ML module: 9-box category prediction")
-        model_pack = train_text_model(df_raw)
-
-        if not model_pack["ok"]:
-            st.warning(f"Model not trained: {model_pack['reason']}")
+            if st.button("Fine-tune DistilBERT", key="bert_btn"):
+                with st.spinner("Downloading model weights and fine-tuning DistilBERT…"):
+                    _res = train_bert_classifier()
+                st.session_state["bert_done"] = True
+                st.rerun()
         else:
-            m1, m2 = st.columns([1, 2])
-            with m1:
-                st.metric("Hold-out accuracy", f"{model_pack['accuracy'] * 100:.1f}%")
-                macro_f1 = model_pack["report"].get("macro avg", {}).get("f1-score", 0.0)
-                st.metric("Macro F1", f"{macro_f1 * 100:.1f}%")
-            with m2:
-                cm = pd.DataFrame(
-                    model_pack["confusion_matrix"],
-                    index=model_pack["labels"],
-                    columns=model_pack["labels"],
+            import torch
+            bert_res = train_bert_classifier()  # instant — served from cache
+
+            if not bert_res["ok"]:
+                st.error(f"BERT training failed: {bert_res['reason']}")
+            else:
+                bm1, bm2, bm3 = st.columns(3)
+                bm1.metric("Test accuracy", f"{bert_res['accuracy'] * 100:.1f}%")
+                macro_f1 = bert_res["report"].get("macro avg", {}).get("f1-score", 0.0)
+                bm2.metric("Macro F1", f"{macro_f1 * 100:.1f}%")
+                weighted_f1 = bert_res["report"].get("weighted avg", {}).get("f1-score", 0.0)
+                bm3.metric("Weighted F1", f"{weighted_f1 * 100:.1f}%")
+
+                bl, br = st.columns(2)
+                with bl:
+                    hist_df = pd.DataFrame(bert_res["history"])
+                    fig_loss = px.line(
+                        hist_df, x="epoch", y="loss", markers=True,
+                        title="Training loss per epoch",
+                        labels={"loss": "Cross-entropy loss", "epoch": "Epoch"},
+                    )
+                    st.plotly_chart(fig_loss, use_container_width=True)
+                with br:
+                    short_labels = [
+                        lbl.split("'")[1] if "'" in lbl else lbl
+                        for lbl in bert_res["labels"]
+                    ]
+                    cm_df = pd.DataFrame(
+                        bert_res["confusion_matrix"],
+                        index=short_labels,
+                        columns=short_labels,
+                    )
+                    fig_cm = px.imshow(
+                        cm_df, text_auto=True,
+                        title="Confusion matrix — test set",
+                        color_continuous_scale="Blues",
+                    )
+                    fig_cm.update_layout(height=520)
+                    st.plotly_chart(fig_cm, use_container_width=True)
+
+                st.subheader("9-box prediction overview")
+                pred_counts = bert_res["test_results"]["predicted_category"].value_counts().to_dict()
+                actual_counts = bert_res["test_results"]["actual_category"].value_counts().to_dict()
+                correct_counts = bert_res["test_results"][bert_res["test_results"]["match"]]["predicted_category"].value_counts().to_dict()
+                matrix_html_rows = []
+                for row in NINE_BOX_LAYOUT:
+                    row_cells = []
+                    for cell in row:
+                        full_label = next(
+                            (lbl for lbl in bert_res["labels"] if f"Box {cell['box']}:" in format_box_label(lbl) or cell["name"].lower() in lbl.lower()),
+                            None,
+                        )
+                        n_pred = pred_counts.get(full_label, 0) if full_label else 0
+                        n_actual = actual_counts.get(full_label, 0) if full_label else 0
+                        n_correct = correct_counts.get(full_label, 0) if full_label else 0
+                        row_cells.append(
+                            f"<div style='background:{cell['color']};border:1px solid #d1d5db;padding:10px 6px;border-radius:8px;"
+                            f"min-height:110px;display:flex;flex-direction:column;justify-content:center;text-align:center'>"
+                            f"<div style='font-size:13px;font-weight:700;color:#111827'>Box {cell['box']} — {cell['name']}</div>"
+                            f"<div style='font-size:11px;color:#374151;margin-top:4px'>{cell['potential']} potential / {cell['performance']} perf.</div>"
+                            f"<div style='font-size:12px;font-weight:600;color:#111827;margin-top:6px'>Predicted: {n_pred}</div>"
+                            f"<div style='font-size:12px;color:#374151'>Actual: {n_actual}</div>"
+                            f"<div style='font-size:12px;color:#166534'>Correct: {n_correct}</div>"
+                            "</div>"
+                        )
+                    matrix_html_rows.append("".join(row_cells))
+                st.markdown(
+                    "<div style='margin-bottom:16px'>"
+                    "<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px'>"
+                    + "".join(matrix_html_rows) +
+                    "</div>"
+                    "<div style='display:flex;justify-content:space-between;margin-top:6px;font-size:12px;color:#6b7280'>"
+                    "<span>← Performance: Low &nbsp; Moderate &nbsp; High →</span>"
+                    "<span>Potential: Low ↓ Moderate ↑ High</span>"
+                    "</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
                 )
-                fig_cm = px.imshow(cm, text_auto=True, title="Confusion matrix")
-                st.plotly_chart(fig_cm, use_container_width=True)
 
-            st.markdown("Prediction sandbox")
-            sample = st.text_area(
-                "Enter synthetic review text",
-                placeholder="Delivered strong technical work and helped teammates, but needs better communication under pressure.",
-                height=110,
-            )
-            if sample.strip():
-                vec = model_pack["vectorizer"].transform([sample])
-                pred = model_pack["model"].predict(vec)[0]
-                probs = model_pack["model"].predict_proba(vec)[0]
-                classes = model_pack["model"].classes_
-                conf = float(probs.max())
+                with st.expander("Per-class metrics"):
+                    metric_rows = []
+                    for lbl in bert_res["labels"]:
+                        r = bert_res["report"].get(lbl, {})
+                        metric_rows.append({
+                            "category": lbl,
+                            "precision": round(r.get("precision", 0), 3),
+                            "recall": round(r.get("recall", 0), 3),
+                            "f1": round(r.get("f1-score", 0), 3),
+                            "support": int(r.get("support", 0)),
+                        })
+                    st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
-                st.success(f"Predicted category: {pred}")
-                st.caption(f"Model confidence: {conf * 100:.1f}%")
+                with st.expander("Test comments: actual vs predicted"):
+                    results_df = bert_res["test_results"].copy()
+                    show_matches_only = st.selectbox(
+                        "Filter rows",
+                        ["All", "Correct only", "Errors only"],
+                        index=0,
+                        key="bert_results_filter",
+                    )
+                    if show_matches_only == "Correct only":
+                        results_df = results_df[results_df["match"]]
+                    elif show_matches_only == "Errors only":
+                        results_df = results_df[~results_df["match"]]
 
-                top_idx = probs.argsort()[-5:][::-1]
-                top_df = pd.DataFrame(
-                    {"category": classes[top_idx], "probability": [float(probs[i]) for i in top_idx]}
+                    st.caption(f"Showing {len(results_df)} test comments from employee_review_mturk_dataset_test_v6_kaggle.csv")
+                    st.dataframe(
+                        results_df[[
+                            col for col in [
+                                "id",
+                                "person_name",
+                                "actual_box",
+                                "predicted_box",
+                                "match",
+                                "confidence",
+                                "feedback",
+                            ]
+                            if col in results_df.columns
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    test_csv = results_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download test predictions CSV",
+                        data=test_csv,
+                        file_name="bert_test_predictions.csv",
+                        mime="text/csv",
+                        key="bert_test_predictions_download",
+                    )
+
+                st.markdown("**Prediction sandbox**")
+                sample_bert = st.text_area(
+                    "Enter employee review text",
+                    placeholder="She consistently delivered high-quality results and proactively mentored junior team members…",
+                    height=100,
+                    key="bert_sandbox",
                 )
-                fig_prob = px.bar(top_df, x="probability", y="category", orientation="h", title="Top predicted categories")
-                st.plotly_chart(fig_prob, use_container_width=True)
+                if sample_bert.strip():
+                    model_b = bert_res["model"]
+                    tokenizer_b = bert_res["tokenizer"]
+                    le_b = bert_res["label_encoder"]
+                    device_b = bert_res["device"]
+                    enc = tokenizer_b(
+                        sample_bert,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=BERT_MAX_LEN,
+                        padding=True,
+                    )
+                    enc = {k: v.to(device_b) for k, v in enc.items()}
+                    with torch.no_grad():
+                        out = model_b(**enc)
+                    probs = torch.softmax(out.logits, dim=-1)[0].cpu().numpy()
+                    pred_idx = int(probs.argmax())
+                    pred_label = le_b.classes_[pred_idx]
+                    conf = float(probs[pred_idx])
+                    pred_info = parse_nine_box_category(pred_label)
+                    st.success(f"Predicted box: {format_box_label(pred_label)}")
+                    st.caption(f"Model confidence: {conf * 100:.1f}%")
+                    p1, p2 = st.columns(2)
+                    p1.metric("Performance", pred_info["performance"])
+                    p2.metric("Potential", pred_info["potential"])
+                    render_nine_box_matrix(pred_label)
+                    prob_df = pd.DataFrame({
+                        "category": [
+                            format_box_label(lbl)
+                            for lbl in le_b.classes_
+                        ],
+                        "probability": probs,
+                    }).sort_values("probability", ascending=True)
+                    fig_prob = px.bar(
+                        prob_df, x="probability", y="category", orientation="h",
+                        title="Class probabilities",
+                    )
+                    st.plotly_chart(fig_prob, use_container_width=True)
 
     export_df = df.copy()
     export_df["bias_flags"] = export_df["bias_flags"].apply(lambda x: "; ".join(x))
