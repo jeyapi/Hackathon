@@ -9,7 +9,7 @@ It helps teams analyze written employee feedback at group level, explore pattern
 - ALLORY Tom
 - BHATT Ankit
 - HADJ-SAID Léa
-- IBRAHIM WAIS Samo
+- IBRAHIM WAIS Abdoussamad
 - JEYACHANDRAN Apinayean
 
 ## Objectives
